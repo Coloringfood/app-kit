@@ -1,0 +1,27 @@
+{
+  "name": "@coloringfood/app-kit",
+  "version": "0.1.0",
+  "description": "Shared server-side building blocks for Coloringfood apps: crash-safe JSON files, named locks and restic-style in-app backups.",
+  "license": "MIT",
+  "type": "module",
+  "repository": { "type": "git", "url": "https://github.com/Coloringfood/app-kit.git" },
+  "engines": { "node": ">=20" },
+  "files": ["dist", "README.md"],
+  "exports": {
+    "./json-file": { "types": "./dist/json-file.d.ts", "import": "./dist/json-file.js" },
+    "./lock": { "types": "./dist/lock.d.ts", "import": "./dist/lock.js" },
+    "./backups": { "types": "./dist/backups/index.d.ts", "import": "./dist/backups/index.js" }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.9"
+  },
+  "volta": { "node": "24.22.0", "npm": "11.19.1" }
+}
