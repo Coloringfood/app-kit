@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -58,6 +58,63 @@ describe('writeFileAtomic / writeJsonFile', () => {
     await writeFileAtomic(file, bytes);
 
     expect(new Uint8Array(await fs.readFile(file))).toEqual(bytes);
+  });
+
+  describe('when Windows keeps refusing the rename (a reader holds the file)', () => {
+    const blockRename = (times: number) => {
+      const realRename = fs.rename.bind(fs);
+      let blocked = 0;
+      return vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+        if (blocked++ < times) throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+        return realRename(from, to);
+      });
+    };
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+    });
+    afterEach(() => {
+      Object.defineProperty(process, 'platform', platform);
+      vi.restoreAllMocks();
+    });
+
+    it('by default falls back to an in-place write after a few quick retries', async () => {
+      const file = path.join(dir, 'data.json');
+      blockRename(100);
+      const warnings: string[] = [];
+
+      await writeFileAtomic(file, 'new', { onWarning: w => warnings.push(w) });
+
+      expect(await fs.readFile(file, 'utf-8')).toBe('new');
+      expect(warnings.join()).toMatch(/in place/);
+      expect(await fs.readdir(dir)).toEqual(['data.json']);
+    });
+
+    it("with onRenameBlocked: 'retry' keeps retrying and never writes in place", async () => {
+      const file = path.join(dir, 'data.json');
+      const rename = blockRename(20);
+      const warnings: string[] = [];
+
+      await writeFileAtomic(file, 'new', { onRenameBlocked: 'retry', onWarning: w => warnings.push(w) });
+
+      expect(await fs.readFile(file, 'utf-8')).toBe('new');
+      expect(rename).toHaveBeenCalledTimes(21);
+      expect(warnings).toEqual([]);
+      expect(await fs.readdir(dir)).toEqual(['data.json']);
+    });
+
+    it("with 'retry' gives up with the error after retryForMs, leaving the old file", async () => {
+      const file = path.join(dir, 'data.json');
+      await fs.writeFile(file, 'old');
+      blockRename(Infinity);
+
+      await expect(writeFileAtomic(file, 'new', { onRenameBlocked: 'retry', retryForMs: 50 }))
+        .rejects.toMatchObject({ code: 'EPERM' });
+
+      expect(await fs.readFile(file, 'utf-8')).toBe('old');
+      expect(await fs.readdir(dir)).toEqual(['data.json']);
+    });
   });
 
   it('never exposes a half-written file to a concurrent reader', async () => {
