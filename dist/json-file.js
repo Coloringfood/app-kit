@@ -52,8 +52,10 @@ const RENAME_ATTEMPTS = 8;
 /** The temp file needs permission on the directory; an in-place write only needs it on the file. */
 const DIR_UNWRITABLE_CODES = new Set(['EACCES', 'EPERM', 'EROFS']);
 let writeSequence = 0;
-async function renameWithRetry(from, to) {
-    for (let attempt = 1; attempt <= RENAME_ATTEMPTS; attempt++) {
+/** True once the rename lands; false only in 'write-in-place' mode when contention beat every attempt. */
+async function renameWithRetry(from, to, mode, retryForMs) {
+    const started = Date.now();
+    for (let attempt = 1;; attempt++) {
         try {
             await fs.rename(from, to);
             return true;
@@ -61,14 +63,15 @@ async function renameWithRetry(from, to) {
         catch (error) {
             if (process.platform !== 'win32' || !CONTENTION_CODES.has(code(error)))
                 throw error;
-            if (attempt === RENAME_ATTEMPTS)
+            if (mode === 'write-in-place' && attempt === RENAME_ATTEMPTS)
                 return false;
-            await new Promise(resolve => setTimeout(resolve, 2 ** (attempt - 1)));
+            if (mode === 'retry' && Date.now() - started >= retryForMs)
+                throw error;
+            await new Promise(resolve => setTimeout(resolve, Math.min(2 ** (attempt - 1), 100)));
         }
     }
-    return false;
 }
-export async function writeFileAtomic(filePath, contents, { onWarning = console.warn } = {}) {
+export async function writeFileAtomic(filePath, contents, { onWarning = console.warn, onRenameBlocked = 'write-in-place', retryForMs = 60_000 } = {}) {
     await fs.mkdir(path.dirname(filePath), { recursive: true });
     // Unique per write so concurrent writers never interleave bytes in a shared temp file.
     const temp = `${filePath}.${process.pid}.${++writeSequence}.tmp`;
@@ -86,7 +89,7 @@ export async function writeFileAtomic(filePath, contents, { onWarning = console.
         return;
     }
     try {
-        if (await renameWithRetry(temp, filePath))
+        if (await renameWithRetry(temp, filePath, onRenameBlocked, retryForMs))
             return;
     }
     catch (error) {
@@ -99,6 +102,6 @@ export async function writeFileAtomic(filePath, contents, { onWarning = console.
     await fs.writeFile(filePath, contents);
     await fs.unlink(temp).catch(() => undefined);
 }
-export async function writeJsonFile(filePath, data, options = {}) {
-    await writeFileAtomic(filePath, JSON.stringify(data, null, options.space ?? 2), options);
+export async function writeJsonFile(filePath, data, { space = 2, ...options } = {}) {
+    await writeFileAtomic(filePath, JSON.stringify(data, null, space), options);
 }

@@ -43,6 +43,17 @@ export async function readJsonFile<T>(filePath: string, defaultValue: T): Promis
 export interface WriteOptions {
   /** Called when the write has to fall back to a non-atomic in-place write. Defaults to console.warn. */
   onWarning?: (message: string) => void;
+  /**
+   * What to do when Windows keeps refusing the rename because readers hold the file:
+   * - 'write-in-place' (default): after ~127ms of 1ms-escalating retries, write in place. Short and
+   *   never fails, but a concurrent read can see a torn file. chore-conqueror relies on this; longer
+   *   delays broke its E2E specs.
+   * - 'retry': keep retrying (backoff capped at 100ms) for up to `retryForMs`, then throw. Always atomic.
+   * Irrelevant on Linux, where the rename never fails this way.
+   */
+  onRenameBlocked?: 'write-in-place' | 'retry';
+  /** How long 'retry' keeps trying. Default 60s (like graceful-fs). */
+  retryForMs?: number;
 }
 
 /**
@@ -58,24 +69,31 @@ const DIR_UNWRITABLE_CODES = new Set(['EACCES', 'EPERM', 'EROFS']);
 
 let writeSequence = 0;
 
-async function renameWithRetry(from: string, to: string): Promise<boolean> {
-  for (let attempt = 1; attempt <= RENAME_ATTEMPTS; attempt++) {
+/** True once the rename lands; false only in 'write-in-place' mode when contention beat every attempt. */
+async function renameWithRetry(
+  from: string,
+  to: string,
+  mode: 'write-in-place' | 'retry',
+  retryForMs: number,
+): Promise<boolean> {
+  const started = Date.now();
+  for (let attempt = 1; ; attempt++) {
     try {
       await fs.rename(from, to);
       return true;
     } catch (error) {
       if (process.platform !== 'win32' || !CONTENTION_CODES.has(code(error))) throw error;
-      if (attempt === RENAME_ATTEMPTS) return false;
-      await new Promise(resolve => setTimeout(resolve, 2 ** (attempt - 1)));
+      if (mode === 'write-in-place' && attempt === RENAME_ATTEMPTS) return false;
+      if (mode === 'retry' && Date.now() - started >= retryForMs) throw error;
+      await new Promise(resolve => setTimeout(resolve, Math.min(2 ** (attempt - 1), 100)));
     }
   }
-  return false;
 }
 
 export async function writeFileAtomic(
   filePath: string,
   contents: string | Uint8Array,
-  { onWarning = console.warn }: WriteOptions = {},
+  { onWarning = console.warn, onRenameBlocked = 'write-in-place', retryForMs = 60_000 }: WriteOptions = {},
 ): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   // Unique per write so concurrent writers never interleave bytes in a shared temp file.
@@ -96,7 +114,7 @@ export async function writeFileAtomic(
   }
 
   try {
-    if (await renameWithRetry(temp, filePath)) return;
+    if (await renameWithRetry(temp, filePath, onRenameBlocked, retryForMs)) return;
   } catch (error) {
     await fs.unlink(temp).catch(() => undefined);
     throw error;
@@ -112,7 +130,7 @@ export async function writeFileAtomic(
 export async function writeJsonFile(
   filePath: string,
   data: unknown,
-  options: WriteOptions & { space?: number } = {},
+  { space = 2, ...options }: WriteOptions & { space?: number } = {},
 ): Promise<void> {
-  await writeFileAtomic(filePath, JSON.stringify(data, null, options.space ?? 2), options);
+  await writeFileAtomic(filePath, JSON.stringify(data, null, space), options);
 }
